@@ -4,99 +4,164 @@ from torch.utils.data import Dataset
 import mediapipe as mp
 from tqdm import tqdm
 import numpy as np
+import skimage
 import os
 import cv2
+import json
 
-## utils
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-mp_face_mesh = mp.solutions.face_mesh
-
-
-
-class DISFA(Dataset) :
-    def __init__(self, root, transform=None, target_transform=None) :
+class Disfa(Dataset) :
+    def __init__(self, root, transform=None, target_transform=None, folds = [2,1], seed = 42, current_fold = 0) :
+        # Original dataset
         self.root = root
+        # Apply transformation on the train and the test set
         self.transform = transform
         self.target_transform = target_transform
 
-        self.target_directory = os.path.abspath(os.path.join(os.path.dirname(self.root), 'pre_processed', 'disfa'))
+        if not self.if_preprocessed() :
+            self.prepare_data()
 
+        self.train_persons, self.test_persons = self.split_persons(folds, seed, current_fold = current_fold)
+
+        self.train_images, self.train_mesh3d, self.train_labels = self.load_data(self.train_persons)
+        self.test_images, self.test_mesh3d, self.test_labels = self.load_data(self.test_persons)
+
+        self.train_dataset = AuDataset(transform=self.transform, images=self.train_images, meshes=self.train_mesh3d, labels=self.train_labels)
+        self.test_dataset = AuDataset(transform=self.transform, images=self.test_images, meshes=self.test_mesh3d, labels=self.test_labels)
+
+
+
+    def split_persons(self, folds, seed, current_fold = 0): 
+        persons = self.persons
+        persons_per_fold = len(persons) // sum(folds)
+
+        # shuffle persons
+        np.random.seed(seed)
+        np.random.shuffle(persons)
+
+        num_test_persons = persons_per_fold * folds[1]
+
+        test_set = persons[current_fold * persons_per_fold : current_fold * persons_per_fold + num_test_persons]
+        train_set = [ p for p in persons if p not in test_set]
+        
+        return train_set, test_set
+
+    @property
+    def persons(self) :
+        return list(sorted(os.listdir(os.path.join(self.root, 'ActionUnitsLabels'))))
+
+    def if_preprocessed(self) :
+        self.target_directory = os.path.abspath(os.path.join(os.path.dirname(self.root), 'pre_processed', 'disfa'))
+        self.status_file = os.path.join(self.target_directory, "status.txt")
         if not os.path.exists(self.target_directory) :
             print("Creating target directory...")
             os.makedirs(self.target_directory)
+            return False
         else :
             print("Target directory already exists...")
-        self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces = 1,
-                                   refine_landmarks=True, 
-                                   min_detection_confidence=0.5, 
-                                   min_tracking_confidence=0.5)
+            return self.if_all_files_preprocessed()
 
-        self.prepare_data()
+    def if_all_files_preprocessed(self) :
+        print("Checking if all files are preprocessed...")
+        if not os.path.exists(self.status_file) :
+            return False
+        else :
+            with open(self.status_file, 'r') as f :
+                status = f.readlines()
+            return len(status) == len(self.persons)
+    
+    def prepare_data(self) :
+        # Path to action units, images and 3d mesh
+        action_units = os.path.join(self.root, 'ActionUnitsLabels')
+        images = os.path.join(self.root, 'Right_Video') # here we only consider right video
 
-    # def _extract_3dmesh(self) :
+        ids = sorted(os.listdir(action_units))
 
-    # def _crop_image(self) :
+        with tqdm(total=len(ids), bar_format="{desc:<15}{percentage:3.0f}%|{bar:50}{r_bar}", leave = False)  as pbar_ :
+            for id_ in ids :
+                pbar_.set_description(f"Person {id_}")
+                # Save whole frame, 3d mesh and cropped image
+                self.read_save_frame(os.path.join(images, f"RightVideo{id_}_comp.avi"), person = id_, mesh3d=True, crop=True)
+                # Save action units
+                self.read_save_action_units(os.path.join(action_units, id_), id_)
+                # Update status
+                with open(self.status_file, 'a') as f :
+                   f.write(f"{id_}\n")
+                f.close() 
+                pbar_.update(1)
 
 
-    def extract_frame(self, video, person, mesh3d=False, crop=False) :
-        # extract frame from video
-        right = True if "Right" in video else False
-        # extract 3d mesh from video
-        # crop image
-        target_image_path = os.path.join(self.target_directory, "images", "right_frame" if right else "left_frame", person )
+    def crop_image(self, landmarks, image) :
+        margin = 0.3
+        shape = image.shape[:2]
+        # bounding box of the face
+        [min_x, min_y], [max_x, max_y] = np.min(landmarks[:,:2], axis = 0), np.max(landmarks[:,:2], axis = 0)
+        height = max_y - min_y ; width  = max_x - min_x
+        # +30% of the face width and height
+        x_min, y_min , x_max , y_max = min_x - margin * width,  min_y - margin * height,  max_x + margin * width, max_y + margin * height
+        x_min , y_min = max(0, int(x_min * shape[1])) , max(0, int(y_min * shape[0])) 
+        x_max , y_max = min(shape[1], int(x_max * shape[1])), min(shape[1], int(y_max * shape[0]))
+        return  image[y_min:y_max, x_min:x_max]
+
+
+    def read_save_frame(self, video, person, mesh3d = False, crop = False) :
+        """Extract frame from video and save them in the target directory"""
+        # Frames Directory
+        target_image_path = os.path.join(self.target_directory, "images", "frame" , person )
         if not os.path.exists(target_image_path) :
             os.makedirs(target_image_path)
 
-        target_mesh3d_path = os.path.join(self.target_directory, "mesh", "right_mesh" if right else "left_mesh", person)
+        # Facemesh Directory
+        target_mesh3d_path = os.path.join(self.target_directory, "facemesh", person)
         if not os.path.exists(target_mesh3d_path) :
             os.makedirs(target_mesh3d_path)
 
+        # Crop images directory
         if crop : 
             target_crop_path = os.path.join(self.target_directory, "images", "crop", person)
             if not os.path.exists(target_crop_path) :
                 os.makedirs(target_crop_path)
 
+        # Read video 
         vidcap = cv2.VideoCapture(video)
-        count = 0
         video_length = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT)) - 1        
-        with tqdm(total=video_length) as pbar:
-            while vidcap.isOpened():
-                success, image = vidcap.read()
-                if not success:
-                    break
-                cv2.imwrite( os.path.join(target_image_path, f"{person}_{count:04d}.jpg"), image)
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                results = self.face_mesh.process(image)
-                face = results.multi_face_landmarks
-                if face is not None : 
-                    landmarks = np.array([ (ld.x, ld.y, ld.z) for ld in face[0].landmark])
-                    if mesh3d :
-                        np.save(os.path.join(target_mesh3d_path, f"{person}_{count:04d}.npy"), landmarks)
-                        if crop :
-                            H, W = image.shape[:2]
-                            _min_x, _min_y, _ =  np.min(landmarks, axis = 0)
-                            _max_x, _max_y, _ =  np.max(landmarks, axis = 0)
-                            height = _max_y - _min_y
-                            width  = _max_x - _min_x
-                            # +30% of the face width and height
-                            x_min, y_min , x_max , y_max = _min_x - 0.20*width,  _min_y - 0.2*height,  _max_x + 0.2*width, _max_y + 0.2*height
-                            x_min, y_min , x_max , y_max = np.int0(x_min*W), np.int0(y_min*H), np.int0(x_max*W), np.int0(y_max*H)
-                            # crop image
-                            image = image[y_min:y_max, x_min:x_max]
-                            # resize image
-                            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                            image = cv2.resize(image, dsize=(256, 256), interpolation = cv2.INTER_AREA)
-                            # save image
-                            cv2.imwrite(os.path.join(self.target_directory, "images", "crop", person, f"{person}_{count:04d}.jpg") , image)
-                count += 1
-                pbar.update(1)
+        with tqdm(total=video_length, bar_format="{desc:<15}{percentage:3.0f}%|{bar:50}{r_bar}", leave = False)  as pbar :
+            with  mp.solutions.face_mesh.FaceMesh(max_num_faces = 1, refine_landmarks=True, min_detection_confidence=0.8, min_tracking_confidence=0.8) as face_mesh :
+                count = 0
+                while vidcap.isOpened():
+                    # read frame
+                    success, image = vidcap.read()
+                    if not success:
+                        break
+                    # save frame
+                    target_frame = os.path.join(target_image_path, f"{person}_frame_{count:04d}.jpg")
+                    target_mesh = os.path.join(target_mesh3d_path, f"{person}_mesh_{count:04d}.npy")
+                    target_crop = os.path.join(target_crop_path, f"{person}_crop_{count:04d}.jpg")
+                    if os.path.exists(target_frame) and os.path.exists(target_crop) and os.path.exists(target_mesh) :
+                        count += 1
+                        pbar.update(1)
+                        continue
+                    cv2.imwrite(target_frame, image)
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    results = face_mesh.process(image)
+                    face = results.multi_face_landmarks
+                    if face is not None : 
+                        landmarks = np.array([ (ld.x, ld.y, ld.z) for ld in face[0].landmark])
+                        if mesh3d :
+                            np.save(target_mesh, landmarks)
+                            if crop :
+                                image = self.crop_image(landmarks, image)
+                                # resize image
+                                image = skimage.transform.resize(image, (256, 256))
+                                skimage.io.imsave(target_crop, (image / image.max() * 255).astype(np.uint8))
+                    count += 1
+                    pbar.update(1)
 
 
-    def extract_action_units(self, au_dir, person) :
+    def read_save_action_units(self, au_dir, person) :
         target_au_directory = os.path.join(self.target_directory, "action_units", person)
         if not os.path.exists(target_au_directory) :
             os.makedirs(target_au_directory)
+
         files = os.listdir(au_dir)
         aus = sorted([ x[len('SN001_'):-len(".txt")] for x in files], key = lambda u : int(u[2:]))
 
@@ -109,55 +174,56 @@ class DISFA(Dataset) :
             au_content = [ int(line.strip().split(",")[1]) for line in au_content]
             all_au.append(au_content)
         
-        # au_per_frame = zip(*all_au)
         au_per_frame = [ dict(zip(aus, frame)) for frame in zip(*all_au) ]
 
         for i, file_ in enumerate(au_per_frame) :
-            np.save(os.path.join(target_au_directory, f"{person}_frame{i:04d}.npy"), file_)
-    
+            np.save(os.path.join(target_au_directory, f"{person}_au_{i:04d}.npy"), file_)
 
 
+    def load_data(self, persons) :
+        images = []
+        meshes = []
+        labels = []
+        for person in persons :
+            person_images = os.path.join(self.target_directory, "images", "crop", person)
+            person_meshes = os.path.join(self.target_directory, "facemesh", person)
+            person_labels = os.path.join(self.target_directory, "action_units", person)
+            images += [ os.path.join(person_images, x) for x in sorted(os.listdir(person_images))]
+            meshes += [ os.path.join(person_meshes, x) for x in sorted(os.listdir(person_meshes))]
+            labels += [ os.path.join(person_labels, x) for x in sorted(os.listdir(person_labels))]
+        return images, meshes, labels    
 
 
+class AuDataset(Dataset) :
+    def __init__(self, transform, images, meshes, labels ) -> None:
+        super(AuDataset, self).__init__()
+        self.images = images
+        self.meshes = meshes
+        self.labels = labels
 
-    def prepare_data(self) :
-        action_units = os.path.join(self.root, 'ActionUnitsLabels')
-        images_right = os.path.join(self.root, 'Right_Video')
-        images_left = os.path.join(self.root, 'Left_Video')
-
-        ids = os.listdir(action_units)
-        for id_ in tqdm(ids) :
-            # extract right frame
-            self.extract_frame(os.path.join(images_right, f"RightVideo{id_}_comp.avi"), 
-                               person = id_, mesh3d=True, crop=True)
-            # # extract left frame
-            self.extract_frame(os.path.join(images_left, f"LeftVideo{id_}_comp.avi"), 
-                               person = id_, mesh3d=True, crop=False)
-            # extract Action Units
-            self.extract_action_units(os.path.join(action_units, id_), id_)
+        self.transform = transform
 
 
+    def __getitem__(self, index) :
+        img, mesh, action_units = self.images[index], self.meshes[index], self.labels[index]
 
+        img = torch.from_numpy(skimage.io.imread(img))
+        mesh = torch.from_numpy(np.load(mesh))
+        action_units = np.load(action_units, allow_pickle=True)
 
-    # def __getitem__(self, index) :
-    #     if self.train :
-    #         img, target = self.train_data[index], self.train_labels[index]
-    #     if self.test :
-    #         img, target = self.test_data[index], self.test_labels[index]
+        if self.transform is not None :
+            mesh = self.transform(mesh)
 
-    #     if self.transform is not None :
-    #         img = self.transform(img)
-    #     if self.target_transform is not None :
-    #         target = self.target_transform(target)
+        return img, mesh, action_units
 
-    #     return img, target
-
-    # def __len__(self) :
-    #     if self.train :
-    #         return len(self.train_data)
-    #     if self.test :
-    #         return len(self.test_data)
+    def __len__(self) :
+        return len(self.meshes)
 
 if __name__ == '__main__' :
-    dataset = DISFA(root='./data/DISFA', transform=None, target_transform=None)
-    print(dataset.root, dataset.target_directory)
+    dataset = Disfa(root='./data/DISFA', transform=None, target_transform=None)
+
+    trainset = dataset.train_dataset
+
+    for img, mesh, au in trainset :
+        print(img.shape, mesh.shape, au)
+        break
