@@ -25,8 +25,8 @@ class Disfa(Dataset) :
         self.train_images, self.train_mesh3d, self.train_labels = self.load_data(self.train_persons)
         self.test_images, self.test_mesh3d, self.test_labels = self.load_data(self.test_persons)
 
-        self.train_dataset = AuDataset(transform=self.transform, images=self.train_images, meshes=self.train_mesh3d, labels=self.train_labels)
-        self.test_dataset = AuDataset(transform=self.transform, images=self.test_images, meshes=self.test_mesh3d, labels=self.test_labels)
+        self.train_dataset = AuDataset(transform=self.transform, target_transform=self.target_transform, images=self.train_images, meshes=self.train_mesh3d, labels=self.train_labels)
+        self.test_dataset = AuDataset(transform=self.transform, target_transform=self.target_transform, images=self.test_images, meshes=self.test_mesh3d, labels=self.test_labels)
 
 
 
@@ -44,6 +44,20 @@ class Disfa(Dataset) :
         train_set = [ p for p in persons if p not in test_set]
         
         return train_set, test_set
+
+
+    def load_data(self, persons) :
+        images = []
+        meshes = []
+        labels = []
+        for person in persons :
+            person_images = os.path.join(self.target_directory, "images", "crop", person)
+            person_meshes = os.path.join(self.target_directory, "facemesh", person)
+            person_labels = os.path.join(self.target_directory, "action_units", person)
+            images += [ os.path.join(person_images, x) for x in sorted(os.listdir(person_images))]
+            meshes += [ os.path.join(person_meshes, x) for x in sorted(os.listdir(person_meshes))]
+            labels += [ os.path.join(person_labels, x) for x in sorted(os.listdir(person_labels))]
+        return images, meshes, labels    
 
     @property
     def persons(self) :
@@ -79,10 +93,12 @@ class Disfa(Dataset) :
         with tqdm(total=len(ids), bar_format="{desc:<15}{percentage:3.0f}%|{bar:50}{r_bar}", leave = False)  as pbar_ :
             for id_ in ids :
                 pbar_.set_description(f"Person {id_}")
-                # Save whole frame, 3d mesh and cropped image
-                self.read_save_frame(os.path.join(images, f"RightVideo{id_}_comp.avi"), person = id_, mesh3d=True, crop=True)
+
                 # Save action units
-                self.read_save_action_units(os.path.join(action_units, id_), id_)
+                nb_annotated_frames = self.read_save_action_units(os.path.join(action_units, id_), id_)
+
+                # Save whole frame, 3d mesh and cropped image
+                self.read_save_frame(os.path.join(images, f"RightVideo{id_}_comp.avi"), person = id_, nb_annotated_frames = nb_annotated_frames,  mesh3d=True, crop=True)
                 # Update status
                 with open(self.status_file, 'a') as f :
                    f.write(f"{id_}\n")
@@ -104,7 +120,7 @@ class Disfa(Dataset) :
         return  image[y_min:y_max, x_min:x_max]
 
 
-    def read_save_frame(self, video, person, mesh3d = False, crop = False) :
+    def read_save_frame(self, video, person, nb_annotated_frames, mesh3d = False, crop = False) :
         """Extract frame from video and save them in the target directory"""
         # Frames Directory
         target_image_path = os.path.join(self.target_directory, "images", "frame" , person )
@@ -128,7 +144,7 @@ class Disfa(Dataset) :
         with tqdm(total=video_length, bar_format="{desc:<15}{percentage:3.0f}%|{bar:50}{r_bar}", leave = False)  as pbar :
             with  mp.solutions.face_mesh.FaceMesh(max_num_faces = 1, refine_landmarks=True, min_detection_confidence=0.8, min_tracking_confidence=0.8) as face_mesh :
                 count = 0
-                while vidcap.isOpened():
+                while vidcap.isOpened() and count < nb_annotated_frames :
                     # read frame
                     success, image = vidcap.read()
                     if not success:
@@ -174,46 +190,41 @@ class Disfa(Dataset) :
             f.close()
             au_content = [ int(line.strip().split(",")[1]) for line in au_content]
             all_au.append(au_content)
+
+        nb_frames = len(all_au[0])
         
         au_per_frame = [ dict(zip(aus, frame)) for frame in zip(*all_au) ]
 
         for i, file_ in enumerate(au_per_frame) :
             np.save(os.path.join(target_au_directory, f"{person}_au_{i:04d}.npy"), file_)
 
-
-    def load_data(self, persons) :
-        images = []
-        meshes = []
-        labels = []
-        for person in persons :
-            person_images = os.path.join(self.target_directory, "images", "crop", person)
-            person_meshes = os.path.join(self.target_directory, "facemesh", person)
-            person_labels = os.path.join(self.target_directory, "action_units", person)
-            images += [ os.path.join(person_images, x) for x in sorted(os.listdir(person_images))]
-            meshes += [ os.path.join(person_meshes, x) for x in sorted(os.listdir(person_meshes))]
-            labels += [ os.path.join(person_labels, x) for x in sorted(os.listdir(person_labels))]
-        return images, meshes, labels    
+        return nb_frames
+            
 
 
 class AuDataset(Dataset) :
-    def __init__(self, transform, images, meshes, labels ) -> None:
+    def __init__(self, transform, target_transform, images, meshes, labels ) -> None:
         super(AuDataset, self).__init__()
         self.images = images
         self.meshes = meshes
         self.labels = labels
 
         self.transform = transform
+        self.target_transform = target_transform
 
 
     def __getitem__(self, index) :
         img, mesh, action_units = self.images[index], self.meshes[index], self.labels[index]
 
-        img = torch.from_numpy(skimage.io.imread(img))
+        img = skimage.io.imread(img)
         mesh = torch.from_numpy(np.load(mesh))
-        action_units = np.load(action_units, allow_pickle=True)
+        action_units = np.load(action_units, allow_pickle=True).flat[0]
 
         if self.transform is not None :
             mesh = self.transform(mesh)
+        
+        if self.target_transform is not None :
+            action_units = self.target_transform(action_units)
 
         return img, mesh, action_units
 
