@@ -90,7 +90,8 @@ class Disfa(Dataset) :
                 pbar_.update(1)
 
 
-    def crop_image(self, landmarks, image) :
+    @staticmethod
+    def crop_image(landmarks, image) :
         margin = 0.3
         shape = image.shape[:2]
         # bounding box of the face
