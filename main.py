@@ -16,6 +16,7 @@ def dict_to_list(labels) :
 if __name__ == '__main__':
     # Define device
     batch_size = 512
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Set fixed random number seed
     torch.manual_seed(42)
@@ -31,6 +32,8 @@ if __name__ == '__main__':
 
     # Initialize the MLP
     mlp = Model_MLP(input_dim = 478*3, output_dim = 12)
+
+    mlp = mlp.to(device)
 
     # Define the loss function and optimizer
     loss_function = torch.nn.MSELoss()
@@ -50,6 +53,8 @@ if __name__ == '__main__':
 
             # Get inputs
             _, inputs, targets = data
+            inputs = inputs.to(device)
+            targets = targets.to(device)
 
             # Zero the gradients
             optimizer.zero_grad()
