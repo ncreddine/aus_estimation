@@ -1,17 +1,18 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
 
-class Model_MLP(torch.nn.Module):
+class Model_MLP(nn.Module):
     def __init__(self, input_dim, output_dim) -> None:
         super(Model_MLP, self).__init__()
 
-        self.input_fc  = torch.nn.Linear(input_dim, 512)
-        self.bn1 = torch.nn.BatchNorm1d(512)
-        self.hidden_fc = torch.nn.Linear(512, 256)
-        self.bn2 = torch.nn.BatchNorm1d(256)
-        self.output_fc = torch.nn.Linear(256, output_dim)
+        self.input_fc  = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.hidden_fc = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.output_fc = nn.Linear(256, output_dim)
 
     def forward(self, x):
         batch_size = x.shape[0]
